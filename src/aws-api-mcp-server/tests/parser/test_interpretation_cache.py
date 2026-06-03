@@ -36,7 +36,7 @@ def test_credentials_fingerprint_is_deterministic():
 
 def test_credentials_fingerprint_does_not_contain_raw_secret():
     """Raw secret must not appear in the fingerprint."""
-    secret = 'supersecret1234'
+    secret = 'supersecret1234'  # pragma: allowlist secret
     fp = _credentials_fingerprint('AKIA', secret, None)
     assert secret not in fp
 

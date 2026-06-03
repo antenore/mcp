@@ -13,6 +13,7 @@
 # limitations under the License.
 """Configuration for pytest."""
 
+import inspect
 import pytest
 import pytest_asyncio
 from awslabs.aws_documentation_mcp_server.server_utils import get_http_client
@@ -23,11 +24,10 @@ async def _close_and_clear_http_client():
     if get_http_client.cache_info().currsize:
         client = get_http_client()
         aclose = getattr(client, 'aclose', None)
-        if aclose and callable(aclose):
-            try:
-                await aclose()
-            except TypeError:
-                pass  # mock objects can't be awaited
+        if callable(aclose):
+            result = aclose()
+            if inspect.isawaitable(result):
+                await result
     get_http_client.cache_clear()
 
 
