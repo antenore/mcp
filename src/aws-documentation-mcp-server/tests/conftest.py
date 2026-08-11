@@ -14,6 +14,22 @@
 """Configuration for pytest."""
 
 import pytest
+import pytest_asyncio
+from awslabs.aws_documentation_mcp_server import server_utils
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _reset_http_client_cache():
+    """Close and reset the cached httpx clients between tests.
+
+    Reached through the module on every use rather than captured at import:
+    TestVersionImport reloads server_utils, which rebinds these to fresh objects
+    owning a fresh cache, and a captured reference would then clear the old,
+    discarded one.
+    """
+    await server_utils.aclose_http_clients()
+    yield
+    await server_utils.aclose_http_clients()
 
 
 def pytest_addoption(parser):

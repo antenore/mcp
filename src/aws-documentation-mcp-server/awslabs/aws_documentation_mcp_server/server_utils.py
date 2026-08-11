@@ -13,6 +13,7 @@
 # limitations under the License.
 import httpx
 import os
+import time
 from awslabs.aws_documentation_mcp_server.models import (
     SearchResponse,
     SearchTableResponse,
@@ -27,6 +28,7 @@ from awslabs.aws_documentation_mcp_server.util import (
     truncate_large_tables,
 )
 from collections import deque
+from functools import cache
 from importlib.metadata import version
 from loguru import logger
 from mcp.server.fastmcp import Context
@@ -39,13 +41,6 @@ COMMERCIAL_ALLOWED_DOMAIN_REGEXES = (
     r'^https?://docs\.aws\.amazon\.com/',
     r'^https?://awsdocs-neuron\.readthedocs-hosted\.com/',
 )
-
-
-def _docs_client(allowed_domain_regexes: Sequence[str]) -> httpx.AsyncClient:
-    """Build an AsyncClient that re-validates every redirect hop against the allowlist."""
-    return httpx.AsyncClient(
-        event_hooks={'response': [enforce_redirect_allowlist(allowed_domain_regexes)]}
-    )
 
 
 try:
@@ -62,6 +57,51 @@ BASE_USER_AGENT = os.getenv(
 DEFAULT_USER_AGENT = (
     f'{BASE_USER_AGENT} ModelContextProtocol/{__version__} (AWS Documentation Server)'
 )
+
+
+_open_clients: list[httpx.AsyncClient] = []
+
+
+@cache
+def _cached_client(allowed_domain_regexes: Optional[tuple[str, ...]]) -> httpx.AsyncClient:
+    event_hooks = (
+        {'response': [enforce_redirect_allowlist(allowed_domain_regexes)]}
+        if allowed_domain_regexes
+        else {}
+    )
+    client = httpx.AsyncClient(timeout=30.0, event_hooks=event_hooks)
+    _open_clients.append(client)
+    return client
+
+
+def get_http_client(
+    allowed_domain_regexes: Optional[Sequence[str]] = None,
+) -> httpx.AsyncClient:
+    """Return a shared httpx.AsyncClient, one per redirect allowlist.
+
+    Creating a new AsyncClient per request leaks SSL contexts and connection
+    pools in long-running processes. Caching one client per allowlist reuses the
+    underlying connection pool while still re-validating every redirect hop.
+    Callers with no allowlist (the search and recommendation APIs) share a
+    single hook-free client.
+    """
+    return _cached_client(tuple(allowed_domain_regexes) if allowed_domain_regexes else None)
+
+
+get_http_client.cache_clear = _cached_client.cache_clear
+
+
+async def aclose_http_clients() -> None:
+    """Close every cached client and empty the cache."""
+    clients, _open_clients[:] = list(_open_clients), []
+    _cached_client.cache_clear()
+    for client in clients:
+        aclose = getattr(client, 'aclose', None)
+        if callable(aclose):
+            try:
+                await aclose()
+            except TypeError:
+                pass  # mock objects can't be awaited
 
 
 async def read_documentation_impl(
@@ -82,31 +122,31 @@ async def read_documentation_impl(
         url_with_session += f'&query_id={query_id}'
         logger.debug(f'Using query_id {query_id}')
 
-    async with _docs_client(allowed_domain_regexes) as client:
-        try:
-            response = await client.get(
-                url_with_session,
-                follow_redirects=True,
-                headers={
-                    'User-Agent': DEFAULT_USER_AGENT,
-                    'X-MCP-Session-Id': session_uuid,
-                },
-                timeout=30,
-            )
-        except httpx.HTTPError as e:
-            error_msg = f'Failed to fetch {url_str}: {str(e)}'
-            logger.error(error_msg)
-            await ctx.error(error_msg)
-            return error_msg
+    client = get_http_client(allowed_domain_regexes)
+    try:
+        response = await client.get(
+            url_with_session,
+            follow_redirects=True,
+            headers={
+                'User-Agent': DEFAULT_USER_AGENT,
+                'X-MCP-Session-Id': session_uuid,
+            },
+            timeout=30,
+        )
+    except httpx.HTTPError as e:
+        error_msg = f'Failed to fetch {url_str}: {str(e)}'
+        logger.error(error_msg)
+        await ctx.error(error_msg)
+        return error_msg
 
-        if response.status_code >= 400:
-            error_msg = f'Failed to fetch {url_str} - status code {response.status_code}'
-            logger.error(error_msg)
-            await ctx.error(error_msg)
-            return error_msg
+    if response.status_code >= 400:
+        error_msg = f'Failed to fetch {url_str} - status code {response.status_code}'
+        logger.error(error_msg)
+        await ctx.error(error_msg)
+        return error_msg
 
-        page_raw = response.text
-        content_type = response.headers.get('content-type', '')
+    page_raw = response.text
+    content_type = response.headers.get('content-type', '')
 
     if is_html_content(page_raw, content_type):
         content = extract_content_from_html(page_raw)
@@ -116,7 +156,6 @@ async def read_documentation_impl(
 
     result = format_documentation_result(url_str, content, start_index, max_length)
 
-    # Log if content was truncated
     if len(content) > start_index + max_length:
         logger.debug(
             f'Content truncated at {start_index + max_length} of {len(content)} characters'
@@ -125,7 +164,15 @@ async def read_documentation_impl(
     return result
 
 
-SEARCH_RESULT_CACHE = deque(maxlen=3)
+_CACHE_TTL_SECONDS = 30 * 60
+SEARCH_RESULT_CACHE: deque[tuple[float, SearchResponse]] = deque(maxlen=3)
+
+
+def _evict_stale_cache_entries() -> None:
+    """Remove cache entries older than _CACHE_TTL_SECONDS."""
+    now = time.monotonic()
+    while SEARCH_RESULT_CACHE and (now - SEARCH_RESULT_CACHE[-1][0]) > _CACHE_TTL_SECONDS:
+        SEARCH_RESULT_CACHE.pop()
 
 
 def add_search_result_cache_item(search_response: SearchResponse) -> None:
@@ -141,7 +188,8 @@ def add_search_result_cache_item(search_response: SearchResponse) -> None:
         None; updates the global SEARCH_RESULT_CACHE
 
     """
-    SEARCH_RESULT_CACHE.appendleft(search_response)
+    _evict_stale_cache_entries()
+    SEARCH_RESULT_CACHE.appendleft((time.monotonic(), search_response))
 
 
 def get_query_id_from_cache(url: str) -> Optional[str]:
@@ -157,10 +205,10 @@ def get_query_id_from_cache(url: str) -> Optional[str]:
         Query ID of URL, or None
 
     """
-    for search_response in SEARCH_RESULT_CACHE:
+    _evict_stale_cache_entries()
+    for _timestamp, search_response in SEARCH_RESULT_CACHE:
         for search_result in search_response.search_results:
             if search_result.url == url:
-                # Sanitization of query_id just in case
                 query_id = quote(search_response.query_id)
                 return query_id
 
@@ -186,31 +234,31 @@ async def read_sections_impl(
         url_with_session += f'&query_id={query_id}'
         logger.debug(f'Using query_id {query_id}')
 
-    async with _docs_client(allowed_domain_regexes) as client:
-        try:
-            response = await client.get(
-                url_with_session,
-                follow_redirects=True,
-                headers={
-                    'User-Agent': DEFAULT_USER_AGENT,
-                    'X-MCP-Session-Id': session_uuid,
-                },
-                timeout=30,
-            )
-        except httpx.HTTPError as e:
-            error_msg = f'Failed to fetch {url_str}: {str(e)}'
-            logger.error(error_msg)
-            await ctx.error(error_msg)
-            return error_msg
+    client = get_http_client(allowed_domain_regexes)
+    try:
+        response = await client.get(
+            url_with_session,
+            follow_redirects=True,
+            headers={
+                'User-Agent': DEFAULT_USER_AGENT,
+                'X-MCP-Session-Id': session_uuid,
+            },
+            timeout=30,
+        )
+    except httpx.HTTPError as e:
+        error_msg = f'Failed to fetch {url_str}: {str(e)}'
+        logger.error(error_msg)
+        await ctx.error(error_msg)
+        return error_msg
 
-        if response.status_code >= 400:
-            error_msg = f'Failed to fetch {url_str} - status code {response.status_code}'
-            logger.error(error_msg)
-            await ctx.error(error_msg)
-            return error_msg
+    if response.status_code >= 400:
+        error_msg = f'Failed to fetch {url_str} - status code {response.status_code}'
+        logger.error(error_msg)
+        await ctx.error(error_msg)
+        return error_msg
 
-        page_raw = response.text
-        content_type = response.headers.get('content-type', '')
+    page_raw = response.text
+    content_type = response.headers.get('content-type', '')
 
     if not is_html_content(page_raw, content_type):
         return 'Cannot extract sections from non-HTML content. Please use the read_documentation tool instead to get the full document content.'
@@ -269,47 +317,47 @@ async def search_table_impl(
     if query_id:
         url_with_session += f'&query_id={query_id}'
 
-    async with _docs_client(allowed_domain_regexes) as client:
-        try:
-            response = await client.get(
-                url_with_session,
-                follow_redirects=True,
-                headers={
-                    'User-Agent': DEFAULT_USER_AGENT,
-                    'X-MCP-Session-Id': session_uuid,
-                },
-                timeout=30,
-            )
-        except httpx.HTTPError as e:
-            error_msg = f'Failed to fetch {url_str}: {str(e)}'
-            logger.error(error_msg)
-            await ctx.error(error_msg)
-            return SearchTableResponse(
-                url=url_str,
-                section_title=section_title or '',
-                query=query,
-                tables_searched=0,
-                tables_with_matches=0,
-                results=[],
-                error=error_msg,
-            )
+    client = get_http_client(allowed_domain_regexes)
+    try:
+        response = await client.get(
+            url_with_session,
+            follow_redirects=True,
+            headers={
+                'User-Agent': DEFAULT_USER_AGENT,
+                'X-MCP-Session-Id': session_uuid,
+            },
+            timeout=30,
+        )
+    except httpx.HTTPError as e:
+        error_msg = f'Failed to fetch {url_str}: {str(e)}'
+        logger.error(error_msg)
+        await ctx.error(error_msg)
+        return SearchTableResponse(
+            url=url_str,
+            section_title=section_title or '',
+            query=query,
+            tables_searched=0,
+            tables_with_matches=0,
+            results=[],
+            error=error_msg,
+        )
 
-        if response.status_code >= 400:
-            error_msg = f'Failed to fetch {url_str} - status code {response.status_code}'
-            logger.error(error_msg)
-            await ctx.error(error_msg)
-            return SearchTableResponse(
-                url=url_str,
-                section_title=section_title or '',
-                query=query,
-                tables_searched=0,
-                tables_with_matches=0,
-                results=[],
-                error=error_msg,
-            )
+    if response.status_code >= 400:
+        error_msg = f'Failed to fetch {url_str} - status code {response.status_code}'
+        logger.error(error_msg)
+        await ctx.error(error_msg)
+        return SearchTableResponse(
+            url=url_str,
+            section_title=section_title or '',
+            query=query,
+            tables_searched=0,
+            tables_with_matches=0,
+            results=[],
+            error=error_msg,
+        )
 
-        page_raw = response.text
-        content_type = response.headers.get('content-type', '')
+    page_raw = response.text
+    content_type = response.headers.get('content-type', '')
 
     if not is_html_content(page_raw, content_type):
         return SearchTableResponse(

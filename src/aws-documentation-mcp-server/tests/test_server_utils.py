@@ -20,8 +20,8 @@ from awslabs.aws_documentation_mcp_server.server_utils import (
     COMMERCIAL_ALLOWED_DOMAIN_REGEXES,
     DEFAULT_USER_AGENT,
     SEARCH_RESULT_CACHE,
-    _docs_client,
     add_search_result_cache_item,
+    get_http_client,
     get_query_id_from_cache,
     read_documentation_impl,
     read_sections_impl,
@@ -464,17 +464,28 @@ def _onsite_redirect_routes(docs_host):
 class TestRedirectAllowlistEnforcement:
     """End-to-end tests that all three read impls re-validate redirect targets (SSRF-class fix).
 
-    These use httpx.MockTransport with the real _docs_client + redirect event hook, so they
-    exercise the actual follow-redirects path and would fail if an impl stopped routing its
-    fetch through the guarded client.
+    These use httpx.MockTransport with the real allowlisted client + redirect event hook, so
+    they exercise the actual follow-redirects path and would fail if an impl stopped routing
+    its fetch through the guarded client.
     """
 
     def test_docs_client_wires_the_redirect_hook(self):
-        """_docs_client must attach a response event hook; catches a dropped-hook regression."""
-        client = _docs_client(COMMERCIAL_ALLOWED_DOMAIN_REGEXES)
+        """The allowlisted client must attach a response event hook; catches a dropped-hook regression."""
+        client = get_http_client(COMMERCIAL_ALLOWED_DOMAIN_REGEXES)
         assert client.event_hooks.get('response'), (
-            '_docs_client must register a response event hook to re-validate redirects'
+            'get_http_client must register a response event hook to re-validate redirects'
         )
+
+    def test_client_is_shared_per_allowlist(self):
+        """Same allowlist reuses one client; a different allowlist gets its own."""
+        assert get_http_client(COMMERCIAL_ALLOWED_DOMAIN_REGEXES) is get_http_client(
+            COMMERCIAL_ALLOWED_DOMAIN_REGEXES
+        )
+        assert get_http_client(COMMERCIAL_ALLOWED_DOMAIN_REGEXES) is not get_http_client()
+
+    def test_unguarded_client_has_no_redirect_hook(self):
+        """Callers with no allowlist (search/recommend APIs) keep a hook-free shared client."""
+        assert not get_http_client().event_hooks.get('response')
 
     @pytest.mark.asyncio
     async def test_read_documentation_offsite_redirect_blocked(self, monkeypatch):
